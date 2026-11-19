@@ -1,0 +1,15 @@
+{
+  "monitor_interval_sec": 60,
+  "resolve_timeout_sec": 8,
+  "max_rounds": 0,
+  "notify": true,
+  "log_path": "dns_monitor.log",
+  "alert_cooldown_sec": 900,
+  "proxy": "http://127.0.0.1:10100",
+  "doh_server": "https://cloudflare-dns.com/dns-query",
+  "doh_fallback": "https://dns.google/resolve",
+  "compare_with_doh": true,
+  "apps_file": "apps/apps.txt",
+  "domains_file": "domains/monitor_domains.txt",
+  "expect_cidr_file": "domains/domain_expect_cidr.json"
+}
