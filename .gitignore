@@ -13,6 +13,10 @@ venv/
 # 本地本地化配置（如需保留个人代理地址等，可放 config.local.json，不上传）
 config.local.json
 
+# 私人清单（域名、App 均为个人配置，不上传，仅本地维护）
+domains/
+apps/
+
 # 编辑器/系统
 .vscode/
 .idea/
