@@ -8,22 +8,37 @@
 
 ## 目录结构
 
+**仓库中（公开，已上传）**：
 ```
 dns-monitor/
 ├── dns_monitor.py              # 主程序（监测 + 提醒）
 ├── config.json                 # 运行配置（间隔、代理、DoH、文件路径）
-├── domains/                    # 监控域名独立文件夹
-│   ├── monitor_domains.txt     #   监测域名清单（每行一个）
-│   └── domain_expect_cidr.json #   域名→预期 IP 段映射（判污染用）
-├── apps/
-│   └── apps.txt                # 关注的 App 清单（仅记录，不解析）
-├── .gitignore                  # 屏蔽本地运行产物
+├── .gitignore                  # 屏蔽本地私人清单与运行产物
 └── README.md
 ```
 
+**本地维护（私人清单，被 .gitignore 屏蔽，不上传，需自行创建）**：
+```
+dns-monitor/
+├── domains/                    # 监控域名独立文件夹（仅本地）
+│   ├── monitor_domains.txt     #   监测域名清单（每行一个）
+│   └── domain_expect_cidr.json #   域名→预期 IP 段映射（判污染用）
+└── apps/
+    └── apps.txt                #   关注的 App 清单（仅记录，不解析）
+```
+
 > 域名、App、预期段都拆成独立文件，方便单独维护，改域名不用动 `config.json`。
+> 这些清单属于个人私有配置，**不随仓库上传**。clone 本仓库后，需在本地自行创建 `domains/` 和 `apps/` 目录及对应文件，程序才能正常监测。
 
 ## 快速开始
+
+**首次使用（准备私人清单）**：本仓库不含个人域名/App 清单（已屏蔽上传）。clone 后，先在本地创建这两个文件，否则监测列表为空：
+
+```
+dns-monitor/domains/monitor_domains.txt   # 每行一个要监测的域名，如 google.com
+dns-monitor/domains/domain_expect_cidr.json  # 域名→预期IP段（可选，配了判污染更准）
+dns-monitor/apps/apps.txt                 # 关注的App清单（仅记录，可选）
+```
 
 **用代理（推荐，能正确判污染）**：先确保本地代理已开启，然后：
 
