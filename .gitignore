@@ -22,3 +22,8 @@ apps/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 线上打包产物（Release 下载的 exe，本地运行用，不上传）
+*.exe
+build/
+dist/
