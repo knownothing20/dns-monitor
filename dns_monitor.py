@@ -186,7 +186,11 @@ def notify(title, message, cfg):
             msg=message,
             duration="long",
         )
-        n.audio = audio.DefaultAudio()
+        # winotify >= 1.0 用 set_audio(枚举)；旧写法 audio.DefaultAudio() 已移除
+        try:
+            n.set_audio(audio.Default, loop=False)
+        except AttributeError:
+            pass  # 极老版本无音效 API，跳过
         n.show()
     except Exception as e:
         log(f"  [通知] 发送失败：{e}（已降级为日志）", cfg)

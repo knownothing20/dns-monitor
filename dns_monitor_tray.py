@@ -58,6 +58,7 @@ NIM_DELETE = 0x00000002
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
+NIF_INFO = 0x00000010  # 气泡通知（szInfo）
 
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONUP = 0x0202
@@ -222,11 +223,19 @@ class TrayApp:
             if cmd == IDM_STATUS:
                 self.show_status_window()
             elif cmd == IDM_START:
-                self.paused.clear()
-                self.set_tip("DNS-Monitor 监测已开始")
+                if self.paused.is_set():
+                    self.paused.clear()
+                    self.set_tip("DNS-Monitor 监测已开始")
+                    self.show_balloon("DNS-Monitor", "监测已恢复运行")
+                else:
+                    self.show_balloon("DNS-Monitor", "监测已在运行中（启动即自动开始，无需手动点）")
             elif cmd == IDM_PAUSE:
-                self.paused.set()
-                self.set_tip("DNS-Monitor 监测已暂停")
+                if self.paused.is_set():
+                    self.show_balloon("DNS-Monitor", "监测已是暂停状态")
+                else:
+                    self.paused.set()
+                    self.set_tip("DNS-Monitor 监测已暂停")
+                    self.show_balloon("DNS-Monitor", "监测已暂停")
             elif cmd == IDM_QUIT:
                 self.quit()
             return 0
@@ -242,6 +251,15 @@ class TrayApp:
     def set_tip(self, text):
         self.nid.szTip = text[:127]
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
+
+    def show_balloon(self, title, text):
+        """弹托盘气泡通知，给菜单操作可见反馈。"""
+        self.nid.uFlags = NIF_INFO
+        self.nid.szInfoTitle = title[:63]
+        self.nid.szInfo = text[:255]
+        self.nid.dwInfoFlags = 0  # NIIF_NONE
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
+        self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
 
     # ---- 右键菜单 ----
     def show_menu(self, x, y):
@@ -294,7 +312,8 @@ class TrayApp:
             rnd = 0
             while not self.stop_evt.is_set():
                 if self.paused.is_set():
-                    self.stop_evt.wait(interval)
+                    # 短周期等待，让「恢复监测」即时生效，而不是最多等一个完整间隔
+                    self.stop_evt.wait(1)
                     continue
                 rnd += 1
                 dns_monitor.log("—— 第 %d 轮监测 ——" % rnd, self.cfg)
