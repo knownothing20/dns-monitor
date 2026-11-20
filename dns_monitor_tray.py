@@ -7,7 +7,7 @@ dns_monitor_tray.py — DNS-Monitor 托盘常驻入口（Windows，零第三方�
   1. 启动后自动隐藏到系统托盘，不在任务栏显示窗口。
   2. 后台线程持续运行 dns_monitor 的监测逻辑，异常时桌面通知 + 日志。
   3. 托盘图标为 DNS 网络样式（icons/dns_monitor.ico，由 icon_gen.py 生成）。
-  4. 右键菜单：打开状态 / 开始监测 / 暂停 / 退出。
+  4. 右键菜单：查看状态 / 开始监测 / 暂停 / 退出。
 
 说明：
   - 托盘用 ctypes 调用 Windows 原生 Shell API（Shell_NotifyIcon），不依赖 pystray。
@@ -20,6 +20,7 @@ dns_monitor_tray.py — DNS-Monitor 托盘常驻入口（Windows，零第三方�
 
 import argparse
 import os
+import sys
 import threading
 import time
 import traceback
@@ -45,24 +46,29 @@ APP_ID = "DNS-Monitor"
 
 user32 = ctypes.windll.user32
 shell32 = ctypes.windll.shell32
-gdi32 = ctypes.windll.gdi32
 kernel32 = ctypes.windll.kernel32
 
 # 常量
 WM_APP = 0x8000
-WM_USER = 0x0400
-WM_NOTIFYICON = 0x004F
+WM_NULL = 0x0000
+WM_NOTIFYICON = 0x004F  # 自定义托盘回调消息号
 NIM_ADD = 0x00000000
 NIM_MODIFY = 0x00000001
 NIM_DELETE = 0x00000002
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
-NIF_INFO = 0x00000010
 
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONUP = 0x0202
-IDM_SHOW = 101
+
+# 菜单标志
+MF_STRING = 0x00000000
+MF_SEPARATOR = 0x00000800
+MF_CHECKED = 0x00000008
+TPM_RETURNCMD = 0x00000100
+TPM_RIGHTBUTTON = 0x00000002
+
 IDM_START = 102
 IDM_PAUSE = 103
 IDM_QUIT = 104
@@ -73,6 +79,10 @@ MB_OK = 0x00000000
 MB_ICONINFORMATION = 0x00000040
 
 
+# LRESULT = LONG_PTR：64 位系统 8 字节，32 位 4 字节（wintypes 里没有现成的）
+LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+
+
 class NOTIFYICONDATA(ctypes.Structure):
     _fields_ = [
         ("cbSize", wintypes.DWORD),
@@ -81,7 +91,7 @@ class NOTIFYICONDATA(ctypes.Structure):
         ("uFlags", wintypes.UINT),
         ("uCallbackMessage", wintypes.UINT),
         ("hIcon", wintypes.HICON),
-        ("szTip", ctypes.c_wchar * 256),
+        ("szTip", ctypes.c_wchar * 128),
         ("dwState", wintypes.DWORD),
         ("dwStateMask", wintypes.DWORD),
         ("szInfo", ctypes.c_wchar * 256),
@@ -91,20 +101,42 @@ class NOTIFYICONDATA(ctypes.Structure):
     ]
 
 
-class MENUITEMINFO(ctypes.Structure):
+class WNDCLASSW(ctypes.Structure):
     _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("fMask", wintypes.UINT),
-        ("fType", wintypes.UINT),
-        ("fState", wintypes.UINT),
-        ("wID", wintypes.UINT),
-        ("hSubMenu", wintypes.HMENU),
-        ("hbmpChecked", wintypes.HBITMAP),
-        ("hbmpUnchecked", wintypes.HBITMAP),
-        ("dwItemData", wintypes.LPARAM),
-        ("dwTypeData", wintypes.LPVOID),
-        ("cch", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", ctypes.WINFUNCTYPE(
+            LRESULT, wintypes.HWND, wintypes.UINT,
+            wintypes.WPARAM, wintypes.LPARAM)),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
     ]
+
+
+# 64 位下句柄/LRESULT 是 8 字节，必须显式声明 restype，否则按 c_int 截断
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+]
+user32.DefWindowProcW.restype = LRESULT
+user32.DefWindowProcW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+]
+user32.LoadImageW.restype = wintypes.HANDLE
+user32.LoadImageW.argtypes = [
+    wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT,
+]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+shell32.Shell_NotifyIconW.argtypes = [wintypes.UINT, ctypes.c_void_p]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 
 
 # ============ 图标加载 ============
@@ -113,8 +145,9 @@ def load_icon():
     """从 ICO 文件加载图标句柄（零依赖，用 LoadImage）。"""
     if not os.path.exists(ICO_PATH):
         return None
-    h = shell32.LoadImageW(
-        None, ICO_PATH, wintypes.HANDLE, 0, 0,
+    # LoadImageW 属于 user32.dll；参数: (实例, 路径, 类型1=IMAGE_ICON, 宽0, 高0, 标志)
+    h = user32.LoadImageW(
+        None, ICO_PATH, 1, 0, 0,
         0x00000010 | 0x00000040,  # LR_LOADFROMFILE | LR_LOADTRANSPARENT
     )
     return h or None
@@ -129,17 +162,23 @@ class TrayApp:
         self.paused = threading.Event()
         self.monitor_thread = None
         self.cfg = None
-        self.hwnd = None
         self.hicon = load_icon()
         self.nid = NOTIFYICONDATA()
         self.running = True
         self.last_status = ""
 
+        # 窗口过程回调必须挂 self 引用，防止被 GC 后崩溃
+        self._wnd_proc_cb = ctypes.WINFUNCTYPE(
+            LRESULT, wintypes.HWND, wintypes.UINT,
+            wintypes.WPARAM, wintypes.LPARAM
+        )(self.wnd_proc)
+
         # 注册隐藏窗口类
         self.register_class()
         self.hwnd = user32.CreateWindowExW(
             0, "DNSMonitorTrayW", APP_ID,
-            0, 0, 0, 0, 0, None, None, kernel32.GetModuleHandleW(None), None,
+            0, 0, 0, 0, 0, None, None,
+            kernel32.GetModuleHandleW(None), None,
         )
         user32.ShowWindow(self.hwnd, 0)  # 隐藏
         user32.UpdateWindow(self.hwnd)
@@ -150,31 +189,29 @@ class TrayApp:
         self.nid.uID = 1
         self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         self.nid.uCallbackMessage = WM_NOTIFYICON
-        self.nid.hIcon = self.hicon if self.hicon else -1
+        self.nid.hIcon = self.hicon if self.hicon else None
         self.nid.szTip = APP_ID
 
     def register_class(self):
-        wc = user32.WNDCLASSW()
-        wc.lpfnWndProc = ctypes.CFUNCTYPE(
-            ctypes.c_longlong, wintypes.HWND, wintypes.UINT,
-            wintypes.WPARAM, wintypes.LPARAM
-        )(self.wnd_proc)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._wnd_proc_cb
         wc.lpszClassName = "DNSMonitorTrayW"
         wc.hInstance = kernel32.GetModuleHandleW(None)
         wc.hCursor = user32.LoadCursorW(None, 32512)  # IDC_ARROW
-        wc.hIcon = self.hicon if self.hicon else -1
+        wc.hIcon = self.hicon
         wc.hbrBackground = 16  # COLOR_BTNFACE + 1
-        user32.RegisterClassW(ctypes.byref(wc))
+        if not user32.RegisterClassW(ctypes.byref(wc)):
+            raise ctypes.WinError(ctypes.get_last_error())
 
     # ---- 窗口过程 ----
     def wnd_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_NOTIFYICON:
-            nid_id = wparam
             ni_type = lparam & 0xFFFFFFFF
             if ni_type == WM_RBUTTONUP:
-                x = lparam & 0xFFFF
-                y = (lparam >> 16) & 0xFFFF
-                self.show_menu(x, y)
+                # 托盘回调的 lparam 只有鼠标事件号，坐标必须用 GetCursorPos 取
+                pt = wintypes.POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                self.show_menu(pt.x, pt.y)
                 return 0
             if ni_type == WM_LBUTTONUP:
                 self.show_status_window()
@@ -182,7 +219,7 @@ class TrayApp:
             return 0
         if msg == WM_APP:
             cmd = wparam
-            if cmd == IDM_SHOW:
+            if cmd == IDM_STATUS:
                 self.show_status_window()
             elif cmd == IDM_START:
                 self.paused.clear()
@@ -190,8 +227,6 @@ class TrayApp:
             elif cmd == IDM_PAUSE:
                 self.paused.set()
                 self.set_tip("DNS-Monitor 监测已暂停")
-            elif cmd == IDM_STATUS:
-                self.show_status_window()
             elif cmd == IDM_QUIT:
                 self.quit()
             return 0
@@ -201,51 +236,43 @@ class TrayApp:
     def add_tray(self):
         shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.nid))
 
-    def update_tray(self, tip=None, icon=None):
-        if tip:
-            self.nid.szTip = tip
-        if icon is not None:
-            self.nid.hIcon = icon
-        self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
-
     def del_tray(self):
         shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self.nid))
 
     def set_tip(self, text):
-        self.nid.szTip = text
+        self.nid.szTip = text[:127]
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
 
     # ---- 右键菜单 ----
     def show_menu(self, x, y):
         hmenu = user32.CreatePopupMenu()
-        # 设置菜单项
         items = [
             (IDM_STATUS, "查看状态", False),
             (IDM_START, "开始监测", self.paused.is_set()),
             (IDM_PAUSE, "暂停监测", not self.paused.is_set()),
-            (0x80000000, None, None),  # 分隔符
+            (0, None, None),  # 分隔符
             (IDM_QUIT, "退出", False),
         ]
         for mid, text, check in items:
             if text is None:
-                user32.AppendMenuW(hmenu, 0x8000, 0, None)  # MF_SEPARATOR
+                user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
                 continue
-            flags = 0x00000080 if check else 0x00000000  # MF_UNCHECKED / MF_CHECKED
-            if check:
-                flags = 0x00000008  # MF_CHECKED
-            user32.AppendMenuW(hmenu, flags | 0x00000100, mid, text)  # MF_STRING
-        # 用 popup 菜单，跟踪鼠标
-        r = user32.TrackPopupMenu(
-            hmenu, 0x100 | 0x0008, x, y, 0, self.hwnd, None,
+            flags = (MF_CHECKED if check else 0) | MF_STRING
+            user32.AppendMenuW(hmenu, flags, mid, text)
+        # 经典托盘菜单模式：前置 SetForegroundWindow，后置 WM_NULL，
+        # 否则点击菜单外区域时菜单不会自动收起
+        user32.SetForegroundWindow(self.hwnd)
+        cmd = user32.TrackPopupMenu(
+            hmenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, self.hwnd, None,
         )
+        user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
         user32.DestroyMenu(hmenu)
-        if r:
-            user32.PostMessageW(self.hwnd, WM_APP, r, 0)
+        if cmd:
+            user32.PostMessageW(self.hwnd, WM_APP, cmd, 0)
 
-    # ---- 状态窗口（非阻塞，自动消失）----
+    # ---- 状态窗口 ----
     def show_status_window(self):
-        """弹一个非阻塞的提示框显示最近状态。"""
+        """弹提示框显示最近状态（模态，关闭后托盘恢复响应）。"""
         msg = self.last_status or "DNS-Monitor 运行中"
         user32.MessageBoxW(self.hwnd, msg, APP_ID, MB_OK | MB_ICONINFORMATION)
 
@@ -292,7 +319,10 @@ class TrayApp:
                 self.stop_evt.wait(interval)
             dns_monitor.log("监测线程退出。", self.cfg)
         except Exception:
-            dns_monitor.log("监测线程异常：%s" % traceback.format_exc(), self.cfg)
+            try:
+                dns_monitor.log("监测线程异常：%s" % traceback.format_exc(), self.cfg)
+            except Exception:
+                traceback.print_exc()
 
     def start_monitor(self):
         self.monitor_thread = threading.Thread(
