@@ -107,7 +107,7 @@ python dns_monitor.py --no-doh --status
 `domains/domain_expect_status.json` 可给域名声明预期状态，例如：
 
 ```json
-{ "linux.do": "POLLUTED", "t66y.com": "POLLUTED" }
+{ "blocked-site.example": "POLLUTED" }
 ```
 
 已知被墙的域名测出污染属「符合预期」：**不弹通知、不计异常、不写异常记录**。
