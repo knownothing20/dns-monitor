@@ -51,6 +51,10 @@ kernel32 = ctypes.windll.kernel32
 # 常量
 WM_APP = 0x8000
 WM_NULL = 0x0000
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
 WM_NOTIFYICON = 0x004F  # 自定义托盘回调消息号
 NIM_ADD = 0x00000000
 NIM_MODIFY = 0x00000001
@@ -280,6 +284,20 @@ class TrayApp:
                     self.show_balloon("DNS-Monitor", "监测已暂停")
             elif cmd == IDM_QUIT:
                 self.quit()
+            return 0
+        # 托盘常驻程序的隐藏主窗口绝不能被外部消息关掉：
+        # WM_CLOSE / WM_DESTROY 一律拦截（否则任何窗口管理工具、
+        # RDP 会话切换、任务栏整理等发出的一次 WM_CLOSE 就会让
+        # 托盘静默退出，且不留下任何日志）。退出只走菜单 IDM_QUIT。
+        if msg == WM_CLOSE:
+            dns_monitor.log("收到 WM_CLOSE，已忽略（托盘继续驻留）", self.cfg)
+            return 0
+        if msg == WM_DESTROY:
+            dns_monitor.log("收到 WM_DESTROY，已忽略", self.cfg)
+            return 0
+        # 系统关机/注销：正常退出，同时把托盘图标清理干净
+        if msg == WM_ENDSESSION and wparam:
+            self.del_tray()
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
@@ -575,24 +593,38 @@ class TrayApp:
 
     # ---- 退出 ----
     def quit(self):
+        try:
+            dns_monitor.log("收到退出请求，正在退出托盘", self.cfg)
+        except Exception:
+            pass
         self.running = False
         self.stop_evt.set()
         self.del_tray()
-        user32.DestroyWindow(self.hwnd)
-        kernel32.PostQuitMessage(0)
+        user32.PostQuitMessage(0)
 
     # ---- 消息循环 ----
     def run(self):
         self.add_tray()
         self.start_monitor()
         msg = wintypes.MSG()
-        while self.running:
-            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if ret <= 0:
-                break
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-        self.del_tray()
+        exit_reason = "消息循环正常结束"
+        try:
+            while self.running:
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret == 0:
+                    exit_reason = "收到 WM_QUIT"
+                    break
+                if ret == -1:
+                    exit_reason = "GetMessage 出错"
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            try:
+                dns_monitor.log("托盘消息循环退出：%s" % exit_reason, self.cfg)
+            except Exception:
+                pass
+            self.del_tray()
 
 
 def main():
