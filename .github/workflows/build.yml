@@ -1,0 +1,55 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装打包依赖
+        run: pip install pyinstaller winotify
+
+      - name: 打包托盘版（dns-monitor.exe）
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name dns-monitor
+          --icon "icons/dns_monitor.ico"
+          --add-data "icons/dns_monitor.ico;icons"
+          --hidden-import winotify
+          dns_monitor_tray.py
+
+      - name: 打包命令行版（dns-monitor-cli.exe）
+        run: >
+          pyinstaller --noconfirm --clean --onefile --console
+          --name dns-monitor-cli
+          --icon "icons/dns_monitor.ico"
+          --hidden-import winotify
+          dns_monitor.py
+
+      - name: 发布到 GitHub Release（rolling latest）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if gh release view latest > /dev/null 2>&1; then
+            gh release upload latest dist/dns-monitor.exe dist/dns-monitor-cli.exe --clobber
+          else
+            gh release create latest \
+              --target master \
+              --title "DNS-Monitor（最新构建）" \
+              --notes "由 GitHub Actions 自动打包。下载 exe 后，把 config.json、domains/、apps/ 放在 exe 同目录即可运行。" \
+              dist/dns-monitor.exe dist/dns-monitor-cli.exe
+          fi

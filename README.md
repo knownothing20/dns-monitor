@@ -30,6 +30,24 @@ dns-monitor/
 > 域名、App、预期段都拆成独立文件，方便单独维护，改域名不用动 `config.json`。
 > 这些清单属于个人私有配置，**不随仓库上传**。clone 本仓库后，需在本地自行创建 `domains/` 和 `apps/` 目录及对应文件，程序才能正常监测。
 
+## 下载 exe 直接运行（免 Python）
+
+到 [Releases](https://github.com/knownothing20/dns-monitor/releases) 下载最新构建（由 GitHub Actions 自动打包）：
+
+- `dns-monitor.exe` — 托盘常驻版（双击后驻留系统托盘，右键菜单操作）
+- `dns-monitor-cli.exe` — 命令行版（用法同下文 `python dns_monitor.py`，如 `dns-monitor-cli.exe --status`）
+
+exe 是单文件绿色版，不写注册表。**运行前把个人配置放在 exe 同目录**：
+
+```
+dns-monitor.exe / dns-monitor-cli.exe
+config.json          # 运行配置
+domains/             # 监测域名清单 + 预期 IP 段
+apps/                # 关注 App 清单
+```
+
+配置齐全后双击 `dns-monitor.exe` 即可（首次运行如被 SmartScreen 拦截，点「仍要运行」）。
+
 ## 快速开始
 
 **首次使用（准备私人清单）**：本仓库不含个人域名/App 清单（已屏蔽上传）。clone 后，先在本地创建这两个文件，否则监测列表为空：

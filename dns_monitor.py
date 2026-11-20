@@ -44,7 +44,12 @@ import urllib.error
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# PyInstaller 打包（onefile）后 __file__ 指向临时解压目录，
+# 改用 exe 所在目录，保证 config / domains / 日志 / 状态都跟随 exe。
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 # Google 系常用段（用于给 Google 相关域名做「预期段」判断）
