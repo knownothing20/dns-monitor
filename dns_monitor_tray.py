@@ -75,10 +75,6 @@ IDM_PAUSE = 103
 IDM_QUIT = 104
 IDM_STATUS = 105
 
-# 消息框类型
-MB_OK = 0x00000000
-MB_ICONINFORMATION = 0x00000040
-
 
 # LRESULT = LONG_PTR：64 位系统 8 字节，32 位 4 字节（wintypes 里没有现成的）
 LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
@@ -165,10 +161,6 @@ user32.TrackPopupMenu.argtypes = [
 ]
 user32.DestroyMenu.restype = wintypes.BOOL
 user32.DestroyMenu.argtypes = [wintypes.HMENU]
-user32.MessageBoxW.restype = ctypes.c_int
-user32.MessageBoxW.argtypes = [
-    wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT,
-]
 user32.RegisterClassW.restype = wintypes.ATOM
 user32.RegisterClassW.argtypes = [ctypes.c_void_p]
 user32.LoadCursorW.restype = wintypes.HANDLE
@@ -339,11 +331,188 @@ class TrayApp:
         if cmd:
             user32.PostMessageW(self.hwnd, WM_APP, cmd, 0)
 
-    # ---- 状态窗口 ----
+    # ---- 状态窗口（Tkinter 异常记录窗口，独立线程运行）----
     def show_status_window(self):
-        """弹提示框显示最近状态（模态，关闭后托盘恢复响应）。"""
-        msg = self.last_status or "DNS-Monitor 运行中"
-        user32.MessageBoxW(self.hwnd, msg, APP_ID, MB_OK | MB_ICONINFORMATION)
+        """打开异常记录窗口（防重复：同时只开一个）。"""
+        if getattr(self, "_status_open", False):
+            return
+        self._status_open = True
+
+        def _run():
+            try:
+                self._build_status_window()
+            except Exception:
+                import traceback
+                dns_monitor.log("状态窗口异常：%s" % traceback.format_exc(), self.cfg)
+            finally:
+                self._status_open = False
+
+        threading.Thread(target=_run, name="dns-status-window", daemon=True).start()
+
+    def _build_status_window(self):
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+
+        STATUS_LABEL = {
+            "POLLUTED": ("疑似污染", "#854F0B", "#FAEEDA"),
+            "FAIL": ("真实失败", "#A32D2D", "#FCEBEB"),
+            "CHANGED": ("结果变化", "#633806", "#FAEEDA"),
+            "CHECK": ("需关注", "#3B6D11", "#EAF3DE"),
+        }
+
+        root = tk.Tk()
+        root.title("DNS-Monitor — 异常记录")
+        root.geometry("980x520")
+        root.minsize(760, 380)
+
+        # 顶部状态摘要
+        summary = self.last_status or "DNS-Monitor 运行中"
+        top = tk.Frame(root, padx=12, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, text=summary, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
+        tk.Label(top, text="数据源：dns_monitor_alerts.jsonl（由监测自动记录）",
+                 fg="#888888", font=("Microsoft YaHei UI", 9)).pack(side="right")
+
+        # 表格
+        cols = ("time", "domain", "status", "sys", "clean", "reason")
+        tree_frame = tk.Frame(root)
+        tree_frame.pack(fill="both", expand=True, padx=12)
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        headings = {
+            "time": ("时间", 80, "center"), "domain": ("域名", 130, "w"),
+            "status": ("状态", 80, "center"), "sys": ("系统解析", 150, "w"),
+            "clean": ("干净解析", 150, "w"), "reason": ("说明", 360, "w"),
+        }
+        for c in cols:
+            text, width, anchor = headings[c]
+            tree.heading(c, text=text)
+            tree.column(c, width=width, anchor=anchor, stretch=(c == "reason"))
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        for status, (label, fg, bg) in STATUS_LABEL.items():
+            tree.tag_configure(status, foreground=fg)
+
+        def fmt_ips(row, key, err_key):
+            err = row.get(err_key)
+            ips = row.get(key) or []
+            if ips:
+                return ", ".join(ips[:4])
+            return err or "—"
+
+        def reload_table():
+            tree.delete(*tree.get_children())
+            for i, row in enumerate(dns_monitor.load_alerts_jsonl()):
+                label = STATUS_LABEL.get(row.get("status"), (row.get("status"), None, None))[0]
+                status_key = row.get("status", "")
+                if status_key not in STATUS_LABEL:
+                    status_key = ""
+                tree.insert("", "end", iid=str(i), values=(
+                    row.get("time", ""), row.get("domain", ""), label,
+                    fmt_ips(row, "sys_ips", "sys_error"),
+                    fmt_ips(row, "clean_ips", "clean_error"),
+                    row.get("reason", ""),
+                ), tags=(status_key,))
+
+        def update_summary():
+            s = self.last_status or "DNS-Monitor 运行中"
+            for w in top.winfo_children():
+                if isinstance(w, tk.Label) and w.cget("fg") != "#888888":
+                    w.configure(text=s)
+
+        reload_table()
+
+        # 一键清除（备份后清空异常记录）
+        def clear_records():
+            path = dns_monitor.get_alerts_jsonl_path()
+            if not os.path.exists(path):
+                messagebox.showinfo("DNS-Monitor", "当前没有异常记录", parent=root)
+                return
+            if not messagebox.askyesno(
+                    "DNS-Monitor", "确定清除全部异常记录？\n（清除前会自动备份为 dns_monitor_alerts.jsonl.bak）",
+                    parent=root):
+                return
+            try:
+                bak = path + ".bak"
+                if os.path.exists(bak):
+                    os.remove(bak)
+                os.replace(path, bak)
+                reload_table()
+                messagebox.showinfo("DNS-Monitor", "已清除（备份：%s）" % os.path.basename(bak), parent=root)
+            except Exception as e:
+                messagebox.showerror("DNS-Monitor", "清除失败：%s" % e, parent=root)
+
+        # 一键导出：生成给 agent 的诊断提示词（写文件 + 复制剪贴板）
+        def export_prompt():
+            rows = dns_monitor.load_alerts_jsonl()
+            if not rows:
+                messagebox.showinfo("DNS-Monitor", "当前没有异常记录可导出", parent=root)
+                return
+            proxy = (self.cfg or {}).get("proxy", "")
+            doh = (self.cfg or {}).get("doh_server", "")
+            doh_fb = (self.cfg or {}).get("doh_fallback", "")
+            lines = []
+            lines.append("你是网络与 DNS 诊断专家。请根据下面的 DNS 监测异常记录，逐条诊断原因并给出可执行的解决方案。")
+            lines.append("")
+            lines.append("## 监测原理")
+            lines.append("DNS-Monitor 在 Windows 上对每个域名同时做两套解析：")
+            lines.append("1. 系统解析：本机默认 DNS 的结果（反映实际上网时走的本地解析）")
+            lines.append("2. 干净解析：经本地代理 %s 走 DoH（%s，失败回退 %s）取得的未污染基准" % (proxy, doh, doh_fb))
+            lines.append("")
+            lines.append("状态判定规则：")
+            lines.append("- POLLUTED（疑似污染）：系统解析失败但干净解析可用；或系统 IP 不在该域名的预期 IP 段内")
+            lines.append("- FAIL（真实失败）：系统与干净解析都失败")
+            lines.append("- CHANGED（结果变化）：系统解析与上一轮不同（Cloudflare 等 CDN 共享 IP 抖动不告警）")
+            lines.append("- CHECK（需关注）：未配置预期段的域名，系统解析与干净基准无交集")
+            lines.append("")
+            lines.append("## 当前状态")
+            lines.append(self.last_status or "运行中")
+            lines.append("")
+            lines.append("## 异常记录（共 %d 条，时间倒序）" % len(rows))
+            lines.append("| 时间 | 域名 | 状态 | 系统解析 | 干净解析 | 说明 |")
+            lines.append("|---|---|---|---|---|---|")
+            for row in rows:
+                label = STATUS_LABEL.get(row.get("status"), (row.get("status", ""),))[0]
+                lines.append("| %s | %s | %s | %s | %s | %s |" % (
+                    row.get("time", ""), row.get("domain", ""), label,
+                    fmt_ips(row, "sys_ips", "sys_error").replace("|", "/"),
+                    fmt_ips(row, "clean_ips", "clean_error").replace("|", "/"),
+                    row.get("reason", "").replace("|", "/"),
+                ))
+            lines.append("")
+            lines.append("## 请你完成")
+            lines.append("1. 逐条诊断：区分 DNS 污染/被墙、域名自身故障、CDN 正常轮询、本地网络或代理问题")
+            lines.append("2. 标出哪些需要处理、哪些可以忽略")
+            lines.append("3. 对需要处理的给出具体可执行步骤（命令或配置修改）")
+            lines.append("4. 若信息不足以判断，列出你还需要我提供哪些诊断信息")
+            text = "\n".join(lines)
+
+            out_path = os.path.join(SCRIPT_DIR, "dns_monitor_agent_prompt.txt")
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except Exception as e:
+                messagebox.showerror("DNS-Monitor", "导出失败：%s" % e, parent=root)
+                return
+            root.clipboard_clear()
+            root.clipboard_append(text)
+            root.update_idletasks()
+            messagebox.showinfo(
+                "DNS-Monitor",
+                "已导出 %d 条异常记录：\n\n✔ 提示词已复制到剪贴板，可直接粘贴给 AI agent\n✔ 文件已保存：%s" % (len(rows), out_path),
+                parent=root)
+
+        # 底部按钮
+        bottom = tk.Frame(root, padx=12, pady=10)
+        bottom.pack(fill="x")
+        tk.Button(bottom, text="一键清除记录", fg="#A32D2D", command=clear_records).pack(side="left")
+        tk.Button(bottom, text="一键导出（agent 提示词）", command=export_prompt).pack(side="left", padx=8)
+        tk.Button(bottom, text="刷新", command=lambda: (reload_table(), update_summary())).pack(side="left")
+        tk.Button(bottom, text="关闭", command=root.destroy).pack(side="right")
+
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.mainloop()
 
     # ---- 监测线程 ----
     def monitor_loop(self):
@@ -372,6 +541,7 @@ class TrayApp:
                     records, alerts = dns_monitor.check_all(
                         domains, self.cfg, state, use_doh=True
                     )
+                    dns_monitor.append_alerts_jsonl(alerts, self.cfg)
                     ok = sum(1 for r in records if r["status"] == "OK")
                     bad = len(records) - ok
                     self.last_status = "DNS-Monitor 第 %d 轮：正常 %d / 异常 %d" % (rnd, ok, bad)

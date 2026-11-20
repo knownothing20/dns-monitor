@@ -28,6 +28,7 @@ jobs:
           --icon "icons/dns_monitor.ico"
           --add-data "icons/dns_monitor.ico;icons"
           --hidden-import winotify
+          --hidden-import tkinter
           dns_monitor_tray.py
 
       - name: 打包命令行版（dns-monitor-cli.exe）

@@ -158,6 +158,53 @@ def get_log_path(cfg):
     return lp
 
 
+def get_alerts_jsonl_path():
+    """异常记录 JSONL 路径（状态窗口/导出提示词的数据源）。"""
+    return os.path.join(SCRIPT_DIR, "dns_monitor_alerts.jsonl")
+
+
+def append_alerts_jsonl(alerts, cfg):
+    """把本轮触发的异常记录追加写入 JSONL（每行一个 JSON 对象）。"""
+    if not alerts:
+        return
+    try:
+        with open(get_alerts_jsonl_path(), "a", encoding="utf-8") as f:
+            for r in alerts:
+                f.write(json.dumps({
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "domain": r["domain"],
+                    "status": r["status"],
+                    "reason": r["reason"],
+                    "sys_ips": r["sys_ips"],
+                    "clean_ips": r["clean_ips"],
+                    "sys_error": r["sys_error"],
+                    "clean_error": r["clean_error"],
+                }, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log(f"  ⚠ 异常记录写入失败：{e}", cfg)
+
+
+def load_alerts_jsonl(limit=500):
+    """读取异常记录（时间倒序，最多 limit 条），返回 list[dict]。"""
+    path = get_alerts_jsonl_path()
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return list(reversed(rows[-limit:]))
+
+
 def log(msg, cfg=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -502,6 +549,7 @@ def alert_title(r):
 def run_one_round(cfg, state, domains, notify_on=True, use_doh=True):
     records, alerts = check_all(domains, cfg, state, use_doh=use_doh)
     print_report(records, cfg)
+    append_alerts_jsonl(alerts, cfg)
     if alerts and notify_on:
         log(f"本轮检测到 {len(alerts)} 个异常域名，开始提醒", cfg)
         for r in alerts:
