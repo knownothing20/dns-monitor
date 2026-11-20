@@ -38,11 +38,11 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 
 # PyInstaller 打包（onefile）后 __file__ 指向临时解压目录，
 # 改用 exe 所在目录，保证 config / domains / 日志 / 状态都跟随 exe。
@@ -211,26 +211,44 @@ def is_cloudflare_ip(ip_str):
 # ============ DNS 解析 ============
 
 def resolve_system(domain, timeout=8):
-    """用系统解析器解析 IPv4，带超时保护。返回 (ips, latency_ms, error)。"""
+    """用系统解析器解析 IPv4，带超时保护。返回 (ips, latency_ms, error)。
+
+    用 daemon 线程包一层：getaddrinfo 本身无法设超时，Windows DNS 慢/重试时
+    可能挂起数分钟；超时后直接放弃等待（残留 daemon 线程不阻塞监测轮，
+    也不阻塞进程退出）。此前用 ThreadPoolExecutor 的 with 块退出时会
+    shutdown(wait=True) 无限等卡死线程，把整轮监测拖死。
+    """
     start = time.monotonic()
     result = []
     error = None
-    try:
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(socket.getaddrinfo, domain, 443, socket.AF_INET, socket.SOCK_STREAM)
-            addrs = fut.result(timeout=timeout)
+    holder = {}
+
+    def _worker():
+        try:
+            holder["addrs"] = socket.getaddrinfo(
+                domain, 443, socket.AF_INET, socket.SOCK_STREAM)
+        except Exception as e:
+            holder["exc"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+
+    if t.is_alive():
+        error = f"解析超时（>{timeout}s，已放弃等待）"
+    elif "exc" in holder:
+        e = holder["exc"]
+        if isinstance(e, socket.gaierror):
+            error = f"解析失败：{e}"
+        else:
+            error = f"解析异常：{e}"
+    else:
         seen = set()
-        for a in addrs:
+        for a in holder.get("addrs", []):
             ip = a[4][0]
             if ip not in seen:
                 seen.add(ip)
                 result.append(ip)
-    except FutTimeout:
-        error = f"解析超时（>{timeout}s）"
-    except socket.gaierror as e:
-        error = f"解析失败：{e}"
-    except Exception as e:
-        error = f"解析异常：{e}"
     latency_ms = int((time.monotonic() - start) * 1000)
     return result, latency_ms, error
 

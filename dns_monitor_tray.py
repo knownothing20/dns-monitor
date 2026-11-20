@@ -119,7 +119,9 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
-# 64 位下句柄/LRESULT 是 8 字节，必须显式声明 restype，否则按 c_int 截断
+# 64 位下句柄/WPARAM/LRESULT 是 8 字节。ctypes 对未声明 argtypes 的函数
+# 按 32 位 c_int 传参，高 32 位寄存器残留垃圾——会导致句柄/WPARAM 间歇性
+# 错乱（实测：菜单命令 PostMessage 时灵时不灵）。必须全部显式声明。
 user32.CreateWindowExW.restype = wintypes.HWND
 user32.CreateWindowExW.argtypes = [
     wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
@@ -135,9 +137,57 @@ user32.LoadImageW.argtypes = [
     wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
     ctypes.c_int, ctypes.c_int, wintypes.UINT,
 ]
+user32.PostMessageW.restype = wintypes.BOOL
+user32.PostMessageW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.ShowWindow.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UpdateWindow.restype = wintypes.BOOL
+user32.UpdateWindow.argtypes = [wintypes.HWND]
+user32.DestroyWindow.restype = wintypes.BOOL
+user32.DestroyWindow.argtypes = [wintypes.HWND]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.CreatePopupMenu.restype = wintypes.HMENU
+user32.CreatePopupMenu.argtypes = []
+user32.AppendMenuW.restype = wintypes.BOOL
+user32.AppendMenuW.argtypes = [
+    wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR,
+]
+user32.TrackPopupMenu.restype = wintypes.BOOL
+user32.TrackPopupMenu.argtypes = [
+    wintypes.HMENU, wintypes.UINT,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, ctypes.c_void_p,
+]
+user32.DestroyMenu.restype = wintypes.BOOL
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
+user32.MessageBoxW.restype = ctypes.c_int
+user32.MessageBoxW.argtypes = [
+    wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT,
+]
+user32.RegisterClassW.restype = wintypes.ATOM
+user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+user32.LoadCursorW.restype = wintypes.HANDLE
+# 第二参数是 MAKEINTRESOURCEW(32512)——小整数伪装的指针，用 LPVOID 才能传 int
+user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPVOID]
+user32.GetMessageW.restype = ctypes.c_int
+user32.GetMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+]
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = LRESULT
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.PostQuitMessage.restype = None
+user32.PostQuitMessage.argtypes = [ctypes.c_int]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wintypes.UINT, ctypes.c_void_p]
-user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 
 
 # ============ 图标加载 ============
@@ -264,13 +314,14 @@ class TrayApp:
     # ---- 右键菜单 ----
     def show_menu(self, x, y):
         hmenu = user32.CreatePopupMenu()
-        items = [
-            (IDM_STATUS, "查看状态", False),
-            (IDM_START, "开始监测", self.paused.is_set()),
-            (IDM_PAUSE, "暂停监测", not self.paused.is_set()),
-            (0, None, None),  # 分隔符
-            (IDM_QUIT, "退出", False),
-        ]
+        items = [(IDM_STATUS, "查看状态", False)]
+        # 动态单项：只显示当前可执行的动作，菜单文字随监测状态自动切换
+        if self.paused.is_set():
+            items.append((IDM_START, "开始监测", False))
+        else:
+            items.append((IDM_PAUSE, "暂停监测", False))
+        items.append((0, None, None))  # 分隔符
+        items.append((IDM_QUIT, "退出", False))
         for mid, text, check in items:
             if text is None:
                 user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
