@@ -371,113 +371,153 @@ def save_state(state_path, state):
 # ============ 监测一轮 ============
 
 def check_all(domains, cfg, state, use_doh=True):
-    """对每个域名做系统解析 +（可选）干净 DoH 解析，对照判定异常。返回 (records, alerts)。"""
+    """两步分级监测，返回 (records, alerts)。
+
+    第一步（不挂代理，纯本地）：系统解析 + 预期段检查 + 与上轮对比，
+      能自判正常的域名直接 OK，不消耗代理。
+    第二步（走代理 DoH）：仅对第一步存疑的域名取干净基准对照，
+      确认污染 / 真实失败 / 正常轮询——最终确认异常才生成提醒。
+    （--no-doh 模式跳过第二步，用上轮对比 + CDN 白名单兜底判定）
+    """
     records = []
+    pending = []
     alerts = []
     now = time.time()
     cooldown = cfg.get("alert_cooldown_sec", 900)
     resolve_timeout = cfg.get("resolve_timeout_sec", 8)
     expect_nets = cfg.get("_expect_nets", {})
 
+    # ---- 第一步：系统解析，本地快速分级（不走代理）----
     for raw in domains:
         domain = normalize_domain(raw)
         sys_ips, sys_latency, sys_error = resolve_system(domain, timeout=resolve_timeout)
-        clean_ips, clean_latency, clean_error = [], None, None
-        if use_doh:
-            clean_ips, clean_latency, clean_error = resolve_doh(domain, cfg)
-
         prev = state.get(domain, {})
         prev_ips = set(prev.get("ips", []))
         cur_set = set(sys_ips)
-
-        record = {
-            "domain": domain,
-            "raw": raw,
-            "sys_ips": sys_ips,
-            "sys_latency_ms": sys_latency,
-            "sys_error": sys_error,
-            "clean_ips": clean_ips,
-            "clean_latency_ms": clean_latency,
-            "clean_error": clean_error,
-            "status": "OK",
-            "reason": "",
-        }
-
-        # —— 状态判定：系统解析 vs 干净解析对照 ——
         expect = expect_nets.get(domain)
 
+        record = {
+            "domain": domain, "raw": raw,
+            "sys_ips": sys_ips, "sys_latency_ms": sys_latency, "sys_error": sys_error,
+            "clean_ips": [], "clean_latency_ms": None, "clean_error": None,
+            "status": "OK", "reason": "", "doh_checked": False,
+        }
+
         if sys_error or not sys_ips:
-            # 系统解析失败 / 无结果
+            # 系统解析失败：需干净基准对照，区分「污染」与「真实失败」
+            record["_why"] = "fail"
+            pending.append(record)
+        elif expect:
+            foreign = [ip for ip in sys_ips if not ip_in_nets(ip, expect)]
+            if foreign:
+                # 解析到非预期段：疑似污染，需干净基准佐证
+                record["_why"] = "foreign"
+                record["_foreign"] = foreign
+                pending.append(record)
+            else:
+                record["status"] = "OK"
+                record["reason"] = "解析正常（系统 IP 均在预期段内）"
+        else:
+            if prev_ips and cur_set == prev_ips and prev.get("verified_ok"):
+                # 上轮已用干净基准验证正常，本轮结果无变化 → 静默通过
+                record["status"] = "OK"
+                record["reason"] = "解析正常（与上轮一致，上轮已用干净基准验证）"
+            else:
+                # 首轮 / 结果变化 / 从未验证过：需基准对照
+                record["_why"] = "verify"
+                if prev_ips and cur_set and cur_set != prev_ips:
+                    record["_changed_from"] = sorted(prev_ips)
+                pending.append(record)
+
+        records.append(record)
+
+    # ---- 第二步：仅对存疑域名走代理 DoH 对照 ----
+    for record in pending:
+        domain = record["domain"]
+        prev = state.get(domain, {})
+        sys_ips = record["sys_ips"]
+        sys_error = record["sys_error"]
+        expect = expect_nets.get(domain)
+        why = record.pop("_why", "verify")
+        foreign = record.pop("_foreign", None)
+        changed_from = record.pop("_changed_from", None)
+        clean_ips, clean_error = [], None
+
+        if use_doh:
+            clean_ips, clean_latency, clean_error = resolve_doh(domain, cfg)
+            record.update(clean_ips=clean_ips, clean_latency_ms=clean_latency,
+                          clean_error=clean_error, doh_checked=True)
+
+        if why == "fail":
             if use_doh and clean_ips:
-                # 干净解析可用 → 本地 DNS 被污染/拦截
                 record["status"] = "POLLUTED"
                 record["reason"] = (
-                    f"系统解析失败（{sys_error or '无结果'}），但干净解析可用 {clean_ips[:3]}，"
-                    "疑似本地 DNS 污染/拦截"
+                    f"系统解析失败（{sys_error or '无结果'}），"
+                    f"但干净解析可用 {clean_ips[:3]}，疑似本地 DNS 污染/拦截"
                 )
             else:
-                # 系统与干净都失败 → 真实失败
                 record["status"] = "FAIL"
-                reason_parts = [sys_error or "系统无解析结果"]
+                parts = [sys_error or "系统无解析结果"]
                 if use_doh:
-                    reason_parts.append(clean_error or "干净解析也无结果")
-                record["reason"] = "；".join(reason_parts)
-        else:
-            # 系统解析成功
-            if expect:
-                # 有预期段：系统 IP 必须落在该段内
-                foreign = [ip for ip in sys_ips if not ip_in_nets(ip, expect)]
-                if foreign:
-                    record["status"] = "POLLUTED"
-                    record["reason"] = (
-                        f"系统解析到非预期段 IP：{foreign}（预期段不包含），疑似解析到错误服务器"
-                    )
-                else:
-                    # 在预期段内，正常（CDN 轮询导致的与干净基准无交集属正常）
-                    record["status"] = "OK"
-                    if use_doh and clean_ips:
-                        overlap = set(sys_ips) & set(clean_ips)
-                        record["reason"] = (
-                            f"解析正常（系统 IP 均在预期段，"
-                            f"{len(overlap)} 个与干净基准一致）"
-                        )
-                    else:
-                        record["reason"] = "解析正常（系统 IP 在预期段内）"
+                    parts.append(clean_error or "干净解析也无结果")
+                record["reason"] = "；".join(parts)
+        elif why == "foreign":
+            if clean_ips:
+                record["status"] = "POLLUTED"
+                record["reason"] = (
+                    f"系统解析到非预期段 IP：{foreign}（干净基准 {clean_ips[:2]}），"
+                    "疑似解析到错误服务器"
+                )
+            elif not use_doh:
+                record["status"] = "POLLUTED"
+                record["reason"] = (
+                    f"系统解析到非预期段 IP：{foreign}（预期段不包含），疑似解析到错误服务器"
+                )
             else:
-                # 无预期段配置
-                if use_doh and clean_ips:
-                    overlap = set(sys_ips) & set(clean_ips)
-                    if overlap:
-                        record["status"] = "OK"
-                        record["reason"] = f"解析正常（{len(overlap)} 个 IP 与干净基准一致）"
-                    else:
-                        # 无交集，但可能是 CDN/代理出口差异，标为「需关注」而非污染
-                        record["status"] = "CHECK"
+                record["status"] = "CHECK"
+                record["reason"] = (
+                    f"系统解析 {sys_ips[:3]} 不在预期段，"
+                    f"且干净解析不可用（{clean_error}），无法对照定性"
+                )
+        else:  # verify：系统解析成功，需基准判定
+            if use_doh and clean_ips:
+                overlap = set(sys_ips) & set(clean_ips)
+                if overlap:
+                    record["status"] = "OK"
+                    if changed_from:
                         record["reason"] = (
-                            f"系统解析 {sys_ips[:3]} 与干净基准 {clean_ips[:3]} 无交集，"
-                            "需关注（可能是 CDN 轮询或代理出口差异，不一定是污染）"
+                            f"解析结果虽变化，但与干净基准一致（{len(overlap)} 个 IP 重合），"
+                            "属正常 CDN/全球调度轮询"
                         )
+                    else:
+                        record["reason"] = f"解析正常（{len(overlap)} 个 IP 与干净基准一致）"
                 else:
-                    record["status"] = "NO_BASELINE"
+                    record["status"] = "CHECK"
                     record["reason"] = (
-                        f"系统解析正常（{sys_ips[:3]}），但干净解析不可用（{clean_error}），跳过污染判定"
+                        f"系统解析 {sys_ips[:3]} 与干净基准 {clean_ips[:3]} 无交集，"
+                        "需关注（可能是 CDN 轮询或代理出口差异，不一定是污染）"
                     )
-
-        # —— 结果变化检测（基于系统解析，对比上一轮，仅对正常/需关注态生效）——
-        if record["status"] in ("OK", "CHECK", "NO_BASELINE"):
-            if prev_ips and cur_set and cur_set != prev_ips:
-                changed = cur_set - prev_ips
-                changed_non_cdn = [ip for ip in changed if not is_cloudflare_ip(ip)]
-                if changed_non_cdn:
-                    record["status"] = "CHANGED"
-                    record["reason"] = (
-                        f"解析结果变化：新增 {sorted(changed_non_cdn)}（原 {sorted(prev_ips)}）"
-                    )
+            elif not use_doh:
+                # 无代理模式：没有基准，只能靠与上轮对比
+                if changed_from:
+                    changed = set(sys_ips) - set(changed_from)
+                    non_cdn = [ip for ip in changed if not is_cloudflare_ip(ip)]
+                    if non_cdn:
+                        record["status"] = "CHANGED"
+                        record["reason"] = (
+                            f"解析结果变化：新增 {sorted(non_cdn)}（原 {changed_from}）"
+                        )
+                    else:
+                        record["reason"] = "解析结果变化，但为 CDN/云共享 IP，属正常轮询"
                 else:
-                    record["reason"] = "解析结果变化，但为 CDN/云共享 IP，属正常轮询"
-            elif prev_ips and not cur_set:
-                record["status"] = "CHANGED"
-                record["reason"] = f"原 {sorted(prev_ips)}，本轮无结果"
+                    record["status"] = "OK"
+                    record["reason"] = "首轮记录基准（无代理模式，仅记录）"
+            else:
+                record["status"] = "NO_BASELINE"
+                record["reason"] = (
+                    f"系统解析正常（{sys_ips[:3]}），"
+                    f"但干净解析不可用（{clean_error}），跳过污染判定"
+                )
 
         # —— 生成提醒（FAIL / POLLUTED / CHANGED / CHECK，带冷却）——
         if record["status"] in ("FAIL", "POLLUTED", "CHANGED", "CHECK"):
@@ -486,15 +526,15 @@ def check_all(domains, cfg, state, use_doh=True):
                 alerts.append(record)
                 record["last_alert"] = now
 
-        records.append(record)
-
-    # 更新状态（保存系统解析结果用于下轮对比）
+    # 更新状态：verified_ok = 最近一次被「预期段 / 干净基准」验证为正常
     for r in records:
+        prev = state.get(r["domain"], {})
         state[r["domain"]] = {
             "ips": r["sys_ips"],
             "sys_latency_ms": r["sys_latency_ms"],
             "clean_ips": r["clean_ips"],
-            "last_alert": r.get("last_alert", 0),
+            "last_alert": r.get("last_alert", prev.get("last_alert", 0)),
+            "verified_ok": r["status"] == "OK",
         }
     return records, alerts
 
