@@ -52,6 +52,14 @@ else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
+# Windows 控制台默认 GBK，输出 emoji 状态符号会 UnicodeEncodeError；
+# 强制 stdout/stderr 走 UTF-8 并容错替换（exe 打包后在中文系统上必需）。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # Google 系常用段（用于给 Google 相关域名做「预期段」判断）
 GOOGLE_NETS = [
     ipaddress.ip_network(c, strict=False) for c in [
