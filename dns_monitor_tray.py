@@ -560,6 +560,22 @@ class TrayApp:
                     self.stop_evt.wait(1)
                     continue
                 rnd += 1
+                # —— 每轮热加载配置：改域名清单/预期段/预期状态/间隔，下一轮即生效，无需重启托盘 ——
+                try:
+                    fresh = dns_monitor.load_config()
+                    if self.notify_on is False:
+                        fresh["notify"] = False
+                    new_domains = fresh["domains"]
+                    if new_domains != domains:
+                        dns_monitor.log(
+                            "配置热加载：监测域名 %d → %d 个" % (len(domains), len(new_domains)),
+                            fresh)
+                        self.set_tip("DNS-Monitor 运行中（%d 域名）" % len(new_domains))
+                    self.cfg, domains = fresh, new_domains
+                    interval = fresh.get("monitor_interval_sec", 60)
+                    max_rounds = fresh.get("max_rounds", 0)
+                except Exception as e:
+                    dns_monitor.log("配置热加载失败（沿用上一轮配置）：%s" % e, self.cfg)
                 dns_monitor.log("—— 第 %d 轮监测 ——" % rnd, self.cfg)
                 try:
                     records, alerts = dns_monitor.check_all(
