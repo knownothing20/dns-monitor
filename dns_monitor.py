@@ -79,6 +79,25 @@ CLOUDFLARE_NETS = [
     ]
 ]
 
+# 已知 GFW DNS 注入「假 IP 池」：被墙服务商（Facebook/Twitter/Dropbox）的网段，
+# 以及 GFW 研究文献中的经典注入段。系统解析命中即高度怀疑 DNS 污染。
+GFW_FAKE_NETS = [
+    ipaddress.ip_network(c, strict=False) for c in [
+        # Facebook
+        "31.13.24.0/21", "31.13.64.0/18", "66.220.144.0/20", "69.63.176.0/20",
+        "69.171.224.0/19", "129.134.0.0/17", "157.240.0.0/16", "173.252.64.0/18",
+        "185.60.216.0/22",
+        # Twitter / X
+        "69.195.160.0/19", "104.244.40.0/21", "192.133.76.0/22",
+        "199.16.156.0/22", "199.59.148.0/22",
+        # Dropbox
+        "108.160.160.0/20", "162.125.0.0/16",
+        # 经典注入段（GFW 研究文献常见）
+        "8.7.198.0/24", "46.82.174.0/24", "59.24.3.0/24", "93.46.8.0/22",
+        "203.98.7.0/24", "243.186.0.0/16",
+    ]
+]
+
 
 # ============ 基础工具 ============
 
@@ -129,6 +148,7 @@ def load_config(config_path=None):
     domains_file = _resolve_file(cfg, "domains_file", "domains/monitor_domains.txt")
     apps_file = _resolve_file(cfg, "apps_file", "apps/apps.txt")
     expect_file = _resolve_file(cfg, "expect_cidr_file", "domains/domain_expect_cidr.json")
+    expect_status_file = _resolve_file(cfg, "expect_status_file", "domains/domain_expect_status.json")
 
     cfg["domains"] = load_line_list(domains_file)
     cfg["apps"] = load_line_list(apps_file)
@@ -146,6 +166,19 @@ def load_config(config_path=None):
                     ]
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    # 域名→预期状态（如已知被墙域名标记 "POLLUTED"：测出该状态时不提醒、不计异常）
+    cfg["_expect_status"] = {}
+    if expect_status_file and os.path.exists(expect_status_file):
+        try:
+            with open(expect_status_file, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            if isinstance(st, dict):
+                cfg["_expect_status"] = {
+                    str(k).strip(): str(v).strip().upper() for k, v in st.items()
+                }
         except Exception:
             pass
     return cfg
@@ -255,6 +288,21 @@ def is_cloudflare_ip(ip_str):
     return ip_in_nets(ip_str, CLOUDFLARE_NETS)
 
 
+def is_gfw_fake_ip(ip_str):
+    """命中已知 GFW 注入假 IP 池 → 高度怀疑 DNS 污染。"""
+    return ip_in_nets(ip_str, GFW_FAKE_NETS)
+
+
+def same_subnet24(ips_a, ips_b):
+    """两组 IP 是否存在同 /24 前缀的成员（CDN/云厂商正常轮询的强信号）。"""
+    for a in ips_a:
+        pa = a.rsplit(".", 1)[0]
+        for b in ips_b:
+            if b.rsplit(".", 1)[0] == pa:
+                return True
+    return False
+
+
 # ============ DNS 解析 ============
 
 def resolve_system(domain, timeout=8):
@@ -314,17 +362,23 @@ def _http_get_json(url, proxy, timeout=10):
 
 def resolve_doh(domain, cfg, timeout=10):
     """经代理走 DoH 获取干净 IPv4 列表（Cloudflare 优先，失败回退 Google）。
-    返回 (ips, latency_ms, error)。"""
+    返回 (ips, latency_ms, error, doh_status)。
+    doh_status 为最后一次 DoH 应答的 DNS 状态码：
+      0=NOERROR（0 且无 A 记录 = NODATA，域名本身没有 A 记录）
+      2=SERVFAIL（域名权威服务器故障） 3=NXDOMAIN（域名不存在）
+    两个 DoH 都没应答时为 None。"""
     start = time.monotonic()
     proxy = cfg.get("proxy", "")
     doh = cfg.get("doh_server", "https://cloudflare-dns.com/dns-query")
     fallback = cfg.get("doh_fallback", "https://dns.google/resolve")
     ips = []
     error = None
+    doh_status = None
     for base in (doh, fallback):
         try:
             url = f"{base}?name={domain}&type=A"
             data = _http_get_json(url, proxy, timeout=timeout)
+            doh_status = data.get("Status")
             if data.get("Status") == 0:
                 seen = set()
                 out = []
@@ -335,11 +389,11 @@ def resolve_doh(domain, cfg, timeout=10):
                             seen.add(ip)
                             out.append(ip)
                 if out:
-                    return out, int((time.monotonic() - start) * 1000), None
+                    return out, int((time.monotonic() - start) * 1000), None, 0
             error = f"DoH({base}) 无有效结果（Status={data.get('Status')}）"
         except Exception as e:
             error = f"DoH({base}) 失败：{e}"
-    return [], int((time.monotonic() - start) * 1000), error
+    return [], int((time.monotonic() - start) * 1000), error, doh_status
 
 
 def normalize_domain(raw):
@@ -386,6 +440,7 @@ def check_all(domains, cfg, state, use_doh=True):
     cooldown = cfg.get("alert_cooldown_sec", 900)
     resolve_timeout = cfg.get("resolve_timeout_sec", 8)
     expect_nets = cfg.get("_expect_nets", {})
+    expect_status = cfg.get("_expect_status", {})
 
     # ---- 第一步：系统解析，本地快速分级（不走代理）----
     for raw in domains:
@@ -406,6 +461,11 @@ def check_all(domains, cfg, state, use_doh=True):
         if sys_error or not sys_ips:
             # 系统解析失败：需干净基准对照，区分「污染」与「真实失败」
             record["_why"] = "fail"
+            pending.append(record)
+        elif any(is_gfw_fake_ip(ip) for ip in sys_ips):
+            # 系统解析命中已知 GFW 注入假 IP 池：高度怀疑污染，需干净基准确认
+            record["_why"] = "gfw"
+            record["_fake"] = [ip for ip in sys_ips if is_gfw_fake_ip(ip)]
             pending.append(record)
         elif expect:
             foreign = [ip for ip in sys_ips if not ip_in_nets(ip, expect)]
@@ -440,11 +500,13 @@ def check_all(domains, cfg, state, use_doh=True):
         expect = expect_nets.get(domain)
         why = record.pop("_why", "verify")
         foreign = record.pop("_foreign", None)
+        fake = record.pop("_fake", None)
         changed_from = record.pop("_changed_from", None)
         clean_ips, clean_error = [], None
+        doh_status = None
 
         if use_doh:
-            clean_ips, clean_latency, clean_error = resolve_doh(domain, cfg)
+            clean_ips, clean_latency, clean_error, doh_status = resolve_doh(domain, cfg)
             record.update(clean_ips=clean_ips, clean_latency_ms=clean_latency,
                           clean_error=clean_error, doh_checked=True)
 
@@ -455,14 +517,34 @@ def check_all(domains, cfg, state, use_doh=True):
                     f"系统解析失败（{sys_error or '无结果'}），"
                     f"但干净解析可用 {clean_ips[:3]}，疑似本地 DNS 污染/拦截"
                 )
+            elif use_doh and doh_status == 0:
+                # DoH NOERROR 但无 A 记录：域名本身没有 A 记录（NODATA），
+                # 属监控目标选择问题而非网络故障——不提醒，只提示改清单
+                record["status"] = "NODATA"
+                record["reason"] = (
+                    f"系统解析失败（{sys_error}），但该域名本身没有 A 记录"
+                    "（DoH NOERROR 无结果）——建议从监控清单移除，或改用实际访问的主机名"
+                )
             else:
                 record["status"] = "FAIL"
                 parts = [sys_error or "系统无解析结果"]
                 if use_doh:
-                    parts.append(clean_error or "干净解析也无结果")
+                    if doh_status == 3:
+                        parts.append("DoH 显示域名不存在（NXDOMAIN），检查清单拼写或该域名已下线")
+                    elif doh_status == 2:
+                        parts.append("DoH 显示域名权威服务器故障（SERVFAIL），域名方 DNS 问题，非本地网络")
+                    else:
+                        parts.append(clean_error or "干净解析也无结果")
                 record["reason"] = "；".join(parts)
         elif why == "foreign":
-            if clean_ips:
+            if clean_ips and same_subnet24(sys_ips, clean_ips):
+                # 与干净基准同属一个 /24：云厂商内部轮询，非污染
+                record["status"] = "OK"
+                record["reason"] = (
+                    f"系统解析 {sys_ips[:3]} 虽不在预期段，但与干净基准同属一个 /24，"
+                    "属 CDN/云厂商正常轮询"
+                )
+            elif clean_ips:
                 record["status"] = "POLLUTED"
                 record["reason"] = (
                     f"系统解析到非预期段 IP：{foreign}（干净基准 {clean_ips[:2]}），"
@@ -479,6 +561,19 @@ def check_all(domains, cfg, state, use_doh=True):
                     f"系统解析 {sys_ips[:3]} 不在预期段，"
                     f"且干净解析不可用（{clean_error}），无法对照定性"
                 )
+        elif why == "gfw":
+            if clean_ips:
+                record["status"] = "POLLUTED"
+                record["reason"] = (
+                    f"系统解析到已知污染假 IP：{fake}（干净基准 {clean_ips[:2]}），"
+                    "确认 DNS 污染（GFW 注入被墙服务商网段）"
+                )
+            else:
+                record["status"] = "CHECK"
+                record["reason"] = (
+                    f"系统解析到疑似污染 IP：{fake}，"
+                    f"但干净解析不可用（{clean_error}），无法最终确认"
+                )
         else:  # verify：系统解析成功，需基准判定
             if use_doh and clean_ips:
                 overlap = set(sys_ips) & set(clean_ips)
@@ -491,6 +586,13 @@ def check_all(domains, cfg, state, use_doh=True):
                         )
                     else:
                         record["reason"] = f"解析正常（{len(overlap)} 个 IP 与干净基准一致）"
+                elif same_subnet24(sys_ips, clean_ips):
+                    # 与干净基准同属一个 /24：CDN/云厂商内部轮询，非污染
+                    record["status"] = "OK"
+                    record["reason"] = (
+                        f"系统解析 {sys_ips[:3]} 与干净基准 {clean_ips[:3]} 同属一个 /24，"
+                        "属 CDN/云厂商正常轮询"
+                    )
                 else:
                     record["status"] = "CHECK"
                     record["reason"] = (
@@ -521,10 +623,20 @@ def check_all(domains, cfg, state, use_doh=True):
 
         # —— 生成提醒（FAIL / POLLUTED / CHANGED / CHECK，带冷却）——
         if record["status"] in ("FAIL", "POLLUTED", "CHANGED", "CHECK"):
-            last_alert = prev.get("last_alert", 0)
-            if now - last_alert >= cooldown:
-                alerts.append(record)
-                record["last_alert"] = now
+            expected = expect_status.get(domain)
+            if expected and (
+                record["status"] == expected
+                or (expected == "POLLUTED" and record["status"] in ("POLLUTED", "CHECK"))
+            ):
+                # 符合域名已声明的预期状态（如已知被墙域名测出污染）：
+                # 不提醒、不计异常、不写异常记录
+                record["expected"] = True
+                record["reason"] += "；该域名已标记为预期状态（已知被墙），不提醒"
+            else:
+                last_alert = prev.get("last_alert", 0)
+                if now - last_alert >= cooldown:
+                    alerts.append(record)
+                    record["last_alert"] = now
 
     # 更新状态：verified_ok = 最近一次被「预期段 / 干净基准」验证为正常
     for r in records:
@@ -549,6 +661,8 @@ def print_report(records, cfg):
     check = [r for r in records if r["status"] == "CHECK"]
     ok = [r for r in records if r["status"] == "OK"]
     no_baseline = [r for r in records if r["status"] == "NO_BASELINE"]
+    nodata = [r for r in records if r["status"] == "NODATA"]
+    expected_n = [r for r in records if r.get("expected")]
 
     for r in records:
         flag = {
@@ -558,6 +672,7 @@ def print_report(records, cfg):
             "CHANGED": "🟡",
             "CHECK": "🟢",
             "NO_BASELINE": "⚪",
+            "NODATA": "▫️",
         }.get(r["status"], "⚪")
         sys_str = ", ".join(r["sys_ips"]) if r["sys_ips"] else (r["sys_error"] or "(无)")
         clean_str = ", ".join(r["clean_ips"]) if r["clean_ips"] else (r["clean_error"] or "(未启用)")
@@ -570,7 +685,9 @@ def print_report(records, cfg):
 
     print("\n" + "-" * 60)
     print(f"汇总：正常 {len(ok)} | 疑似污染 {len(polluted)} | 结果变化 {len(changed)} "
-          f"| 需关注 {len(check)} | 真实失败 {len(fail)} | 无基准 {len(no_baseline)}")
+          f"| 需关注 {len(check)} | 真实失败 {len(fail)} | 无基准 {len(no_baseline)} "
+          f"| 无A记录 {len(nodata)}"
+          + (f"（其中 {len(expected_n)} 个为已标记预期状态的域名，未提醒）" if expected_n else ""))
     print("=" * 60 + "\n")
 
 

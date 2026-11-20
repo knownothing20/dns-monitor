@@ -1,6 +1,9 @@
 # 本地运行产物（不上传）
 dns_monitor.log
 dns_monitor_state.json
+dns_monitor_alerts.jsonl
+dns_monitor_alerts.jsonl.bak
+dns_monitor_agent_prompt.txt
 *.log
 
 # Python 缓存

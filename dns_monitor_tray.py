@@ -376,6 +376,7 @@ class TrayApp:
             "FAIL": ("真实失败", "#A32D2D", "#FCEBEB"),
             "CHANGED": ("结果变化", "#633806", "#FAEEDA"),
             "CHECK": ("需关注", "#3B6D11", "#EAF3DE"),
+            "NODATA": ("无A记录", "#4A4A4A", "#EEEEEE"),
         }
 
         root = tk.Tk()
@@ -481,11 +482,13 @@ class TrayApp:
                          "取未污染基准对照，确认到底是污染、真实失败，还是其实只是正常 CDN 轮询。" % (proxy, doh, doh_fb))
             lines.append("")
             lines.append("状态判定规则：")
-            lines.append("- POLLUTED（疑似污染）：系统解析失败但干净解析可用；或系统 IP 不在该域名的预期 IP 段内")
-            lines.append("- FAIL（真实失败）：系统与干净解析都失败")
+            lines.append("- POLLUTED（疑似污染）：系统解析失败但干净解析可用；或系统 IP 不在预期段 / 命中已知 GFW 注入假 IP 池（Facebook/Twitter/Dropbox 等被墙服务商网段）")
+            lines.append("- FAIL（真实失败）：系统与干净解析都失败（NXDOMAIN=域名不存在；SERVFAIL=域名权威服务器故障，属域名方问题）")
+            lines.append("- NODATA（无 A 记录）：域名本身没有 A 记录（DoH NOERROR 但无结果），属监控目标配置问题，非网络故障")
             lines.append("- CHANGED（结果变化）：仅在不挂代理模式下使用（上轮与干净基准一致且本轮变化）")
-            lines.append("- CHECK（需关注）：系统解析与干净基准无交集，但可能是 CDN 轮询或代理出口差异")
-            lines.append("- OK（正常）：系统 IP 在预期段内，或与干净基准一致")
+            lines.append("- CHECK（需关注）：系统解析与干净基准无交集（也不在同 /24），可能是 CDN 轮询或代理出口差异")
+            lines.append("- OK（正常）：系统 IP 在预期段内，或与干净基准一致 / 同属一个 /24")
+            lines.append("注：已标记「预期状态」的域名（如已知被墙站点测出污染，见 domains/domain_expect_status.json）符合预期时不提醒、不写入本记录。")
             lines.append("")
             lines.append("## 当前状态")
             lines.append(self.last_status or "运行中")
@@ -563,7 +566,7 @@ class TrayApp:
                         domains, self.cfg, state, use_doh=True
                     )
                     dns_monitor.append_alerts_jsonl(alerts, self.cfg)
-                    ok = sum(1 for r in records if r["status"] == "OK")
+                    ok = sum(1 for r in records if r["status"] == "OK" or r.get("expected"))
                     bad = len(records) - ok
                     self.last_status = "DNS-Monitor 第 %d 轮：正常 %d / 异常 %d" % (rnd, ok, bad)
                     dns_monitor.log(self.last_status, self.cfg)
